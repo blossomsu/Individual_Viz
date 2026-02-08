@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>US State-level Anxiety & Depression (2020–2024)</title>
+<meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no" />
+
+<!--Mapbox GL JS: interactive vector-tile web mapping-->
+<link href="https://api.mapbox.com/mapbox-gl-js/v3.17.0/mapbox-gl.css" rel="stylesheet">
+<script src="https://api.mapbox.com/mapbox-gl-js/v3.17.0/mapbox-gl.js"></script>
+
+<!--D3: CSV loading/parsing-->
+<script src="https://d3js.org/d3.v7.min.js"></script>
+
+<!--Plotly: interactive time-series line chart (hover/click events)-->
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+
+<style>
+  body { margin:0; padding:0; font-family: Arial, sans-serif; }
+  #layout { position:absolute; top:0; bottom:0; width:100%; display:flex; }
+  
+  /* Left panel*/
+  #panel {
+    width: 400px; min-width: 340px; max-width: 480px;
+    padding: 12px; background: rgba(255,255,255,0.97);
+    overflow:auto; border-right: 1px solid #ddd;
+  }
+
+  #map { flex: 1; }
+
+  h2 { margin:0 0 8px 0; font-size:16px; }
+  .small { font-size:12px; color:#444; line-height:1.35; }
+  /* panel box container for legend, slider, chart, info boxes */
+  .box { border:1px solid #ddd; border-radius:8px; padding:10px; margin-top:10px; }
+
+  /* Slider spans full panel width */
+  #slider { width:100%; }
+
+  /* Plotly chart container */
+  #chart { height: 300px; margin-top: 10px; }
+  #legend .row{ display:flex; align-items:center; margin:4px 0; }
+  #legend .sw{ width:18px; height:12px; border:1px solid #ccc; margin-right:8px; }
+</style>
+</head>
+
+<body>
+<div id="layout">
+  <!--  Left panel: title, legend, slider, chart, info boxes -->
+  <div id="panel">
+    <h2>State-level Anxiety & Depression Symptoms (2020–2024)</h2>
+    <div class="small">
+      Main Indicator (AD): % of adults reporting frequent symptoms in the last 7 days (HPS; late April waves).<br>
+    </div>
+
+    <div id="legend" class="box"></div>
+    
+    <!-- Year slider -->
+    <div class="box">
+      <input id="slider" type="range" min="2020" max="2024" step="1" value="2020" list="year-ticks">
+      <!-- Slider tick marks -->
+      <datalist id="year-ticks">
+        <option value="2020" label="2020"></option>
+        <option value="2021" label="2021"></option>
+        <option value="2022" label="2022"></option>
+        <option value="2023" label="2023"></option>
+        <option value="2024" label="2024"></option>
+      </datalist>
+      <div class="small">Year: <b><span id="yearLabel">2020</span></b></div>
+    </div>
+
+     <!-- Plotly chart container -->
+    <div id="chart" class="box"></div>
+
+    <!-- Hover updated: map or line chart -->
+    <div id="hoverBox" class="box small">
+      Hover a state on the map (or a line) to see values.
+    </div>
+
+    <!-- Click selection updated: map or line chart -->
+    <div id="selectBox" class="box small">
+      Click a state (or a line) to select it.
+    </div>
+
+    <div class="small" style="margin-top:10px;">
+      Boundaries: US Census Cartographic Boundary Files (2022).<br>
+      Mental health: Household Pulse Survey (late April 2020–2024 waves).<br>
+      Libraries: Mapbox GL JS, Plotly, D3.
+    </div>
+  </div>
+  <!-- Right panel: Mapbox map container-->
+  <div id="map"></div>
+</div>
+
+<script>
+// Mapbox token
+mapboxgl.accessToken = 'pk.eyJ1IjoiYmxvc3NvbXN1IiwiYSI6ImNta29lbW84ZTAxb2ozZXM2NHd0dTF4OHkifQ.XAY4yujSQ8_TNODnqdp9fw';
+
+// Mapbox tileset Map ID (state boundaries)
+const TILESET_URL = 'mapbox://blossomsu.d8j98wzd'; // e.g. mapbox://sulin.us-states-48-0ygnn2
+
+// Name of tilesets
+const SOURCE_LAYER = 'us_states_48-0ygnn2';
+
+// CSV path (local file)
+const CSV_PATH = 'data/mental_health.csv';
+
+const YEARS = [2020, 2021, 2022, 2023, 2024];
+
+const valuesByYear = {};   // valuesByYear[year][statefp] = {ad_pct, anxiety_pct, depression_pct}
+const seriesByState = {};  // seriesByState[statefp] = [{year, ad_pct, anxiety_pct, depression_pct},...]
+const nameByState = {};    // nameByState[statefp] = state_name
+const nationalMean = {};   // nationalMean[year] = mean ad
+
+
+let selectedYear = 2020;//controlled by slider
+let selectedStatefp = null;//set on click events (map/chart)
+let hoveredStatefp = null;//set on hover events (map/chart)
+
+// Mapbox layer ids
+const L_FILL = 'states-fill';
+const L_OUTLINE = 'states-outline';
+const L_HOVER = 'states-hover-outline';// hover highlight (outline)
+const L_SELECTED = 'states-selected-outline';// selected highlight (outline)
+
+let map;
+
+/* Plotly trace indexing
+   statefp -> traceIndex */
+const traceIndexByState = new Map(); 
+let nationalTraceIndex = null;
+
+const COLOR_MIN = 20;
+const COLOR_MAX = 50;
+
+function choroplethExpression() {
+  return [
+    'interpolate', ['linear'], ['feature-state', 'ad'],
+    COLOR_MIN, '#2166ac',
+    COLOR_MIN + (COLOR_MAX-COLOR_MIN)*0.25, '#67a9cf',
+    COLOR_MIN + (COLOR_MAX-COLOR_MIN)*0.50, '#f4c7b6',
+    COLOR_MIN + (COLOR_MAX-COLOR_MIN)*0.75, '#ef8a62',
+    COLOR_MAX, '#b2182b'
+  ];
+}
+
+function renderLegend() {
+  const legend = document.getElementById('legend');
+  legend.innerHTML = `<div style="font-weight:bold; margin-bottom:6px;">AD prevalence (%)</div>`;
+  const sw = ['#2166ac','#67a9cf','#f4c7b6','#ef8a62','#b2182b'];
+
+  const breaks = [
+    COLOR_MIN,
+    COLOR_MIN + (COLOR_MAX-COLOR_MIN)*0.25,
+    COLOR_MIN + (COLOR_MAX-COLOR_MIN)*0.50,
+    COLOR_MIN + (COLOR_MAX-COLOR_MIN)*0.75,
+    COLOR_MAX
+  ];
+
+  for (let i=0; i<sw.length; i++) {
+    const v1 = breaks[i];
+    const v2 = (i < sw.length-1) ? breaks[i+1] : COLOR_MAX;
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = `<div class="sw" style="background:${sw[i]}"></div>
+                     <div class="small">${v1.toFixed(1)} - ${v2.toFixed(1)}</div>`;
+    legend.appendChild(row);
+  }
+
+  const hint = document.createElement('div');
+  hint.className = 'small';
+  hint.style.marginTop = '6px';
+  hint.innerHTML = `Fixed scale for 2020-2024 comparison.`;
+  legend.appendChild(hint);
+}
+
+/* Load and parse the CSV */
+async function loadCSV() {
+  const rows = await d3.csv(CSV_PATH);
+
+  for (const r of rows) {
+    const fips = String(r.STATEFP).padStart(2,'0');// // Standardise FIPS to a 2-digit string (e.g., "06")
+    const year = +r.year;
+    // Parse numeric values
+    const ad  = +r.ad_pct;
+    const anx = +r.anxiety_pct;
+    const dep = +r.depression_pct;
+
+    if (!valuesByYear[year]) valuesByYear[year] = {};
+    valuesByYear[year][fips] = { ad, anx, dep };// Year -> state -> values (fast lookup for map & hover)
+
+    if (!seriesByState[fips]) seriesByState[fips] = [];
+    seriesByState[fips].push({ year, ad, anx, dep }); // State -> time series (used to build the Plotly line chart)
+
+    nameByState[fips] = r.state_name;// Name lookup for UI text
+  }
+
+  // sort
+  for (const fips of Object.keys(seriesByState)) {
+    seriesByState[fips].sort((a,b)=>a.year-b.year);
+  }
+
+  // national mean per year (ad)
+  for (const y of YEARS) {
+    const vals = Object.values(valuesByYear[y] || {}).map(d=>d.ad).filter(Number.isFinite);
+    nationalMean[y] = vals.length ? (vals.reduce((a,b)=>a+b,0)/vals.length) : null;
+  }
+}
+
+/* Map initialisation (Mapbox GL JS) */
+function initMap() {
+  map = new mapboxgl.Map({
+    container: 'map',
+    style: 'mapbox://styles/blossomsu/cmlc7i1si001k01r01iyshh17',
+    center: [-98, 38],// starting position [lng, lat]
+    zoom: 3.5,// starting zoom
+    minZoom: 3, 
+    maxZoom: 6
+  });
+  // disable map rotation using right click + drag
+  map.dragRotate.disable();
+
+  // disable map rotation using touch rotation gesture
+  map.touchZoomRotate.disableRotation();
+
+  map.addControl(new mapboxgl.NavigationControl());
+
+  map.on('load', () => {
+    //Add vector tileset source
+    map.addSource('states', {
+      type: 'vector',
+      url: TILESET_URL,
+      promoteId: { [SOURCE_LAYER]: 'STATEFP' }//identify each state by STATEFP (FIPS code)
+    });
+
+    // fill layer
+    map.addLayer({
+      id: L_FILL,
+      type: 'fill',
+      source: 'states',
+      'source-layer': SOURCE_LAYER,
+      paint: {
+        'fill-color': [
+          'case',
+          ['!=', ['feature-state','ad'], null],
+          choroplethExpression(),
+          '#eeeeee'
+        ],
+        'fill-opacity': 0.92
+      }
+    });
+
+    // base outline
+    map.addLayer({
+      id: L_OUTLINE,
+      type: 'line',
+      source: 'states',
+      'source-layer': SOURCE_LAYER,
+      paint: { 'line-color': '#ffffff', 'line-width': 1.2, 'line-opacity': 0.95 }
+    });
+
+    // hover outline
+    map.addLayer({
+      id: L_HOVER,
+      type: 'line',
+      source: 'states',
+      'source-layer': SOURCE_LAYER,
+      paint: { 'line-color': '#9C27B0', 'line-width': 3.2, 'line-opacity': 0.95 },
+      filter: ['==', ['get','STATEFP'], '']
+    });
+
+    // selected outline
+    map.addLayer({
+      id: L_SELECTED,
+      type: 'line',
+      source: 'states',
+      'source-layer': SOURCE_LAYER,
+      paint: { 'line-color': '#ff6b00', 'line-width': 4.2, 'line-opacity': 0.95 },
+      filter: ['==', ['get','STATEFP'], '']
+    });
+
+    // apply first year
+    applyYearToFeatureState(selectedYear);
+
+    // slider: update selected year + re-bind feature-state values
+    document.getElementById('slider').addEventListener('input', (e) => {
+      selectedYear = +e.target.value;
+      document.getElementById('yearLabel').textContent = String(selectedYear);
+
+      applyYearToFeatureState(selectedYear);
+
+      if (hoveredStatefp) updateHoverBox(hoveredStatefp);
+      if (selectedStatefp) updateSelectBox(selectedStatefp);
+    });
+
+    // map hover: highlight outline + update hover box + highlight chart line
+    map.on('mousemove', L_FILL, (e) => {
+      if (!e.features || !e.features.length) return;
+      const fips = String(e.features[0].properties.STATEFP).padStart(2,'0');
+
+      hoveredStatefp = fips;
+      map.setFilter(L_HOVER, ['==', ['get','STATEFP'], fips]);
+
+      updateHoverBox(fips);
+      setChartHoverState(fips);
+    });
+
+    //Leave map layer => clear hover highlight and revert chart to default/selected state
+    map.on('mouseleave', L_FILL, () => {
+      hoveredStatefp = null;
+      map.setFilter(L_HOVER, ['==', ['get','STATEFP'], '']);
+
+      if (selectedStatefp) {
+        setChartSelectedState(selectedStatefp);
+      } else {
+        setChartDefaultState();
+      }
+      document.getElementById('hoverBox').innerHTML = 'Hover a state on the map (or a line) to see values.';
+    });//If a state is selected, keep it highlighted; otherwise revert to default
+
+    // map click select
+    map.on('click', L_FILL, (e) => {
+      if (!e.features || !e.features.length) return;
+      const fips = String(e.features[0].properties.STATEFP).padStart(2,'0');
+      selectState(fips);
+    });
+
+    // click blank to clear selection
+    map.on('click', (e) => {
+      const feats = map.queryRenderedFeatures(e.point, { layers: [L_FILL] });
+      if (!feats.length) clearSelection();
+    });
+
+    // make basemap labels darker & sharper
+    darkenBaseLabels();
+  });
+}
+
+function darkenBaseLabels() {
+  const layers = map.getStyle().layers;
+  for (const lyr of layers) {
+    if (lyr.type === 'symbol' && lyr.layout && lyr.layout['text-field']) {
+
+      if (map.getPaintProperty(lyr.id, 'text-color') !== undefined) {
+        map.setPaintProperty(lyr.id, 'text-color', '#3f3f3f');
+      }
+
+      if (map.getPaintProperty(lyr.id, 'text-halo-width') !== undefined) {
+        map.setPaintProperty(lyr.id, 'text-halo-width', 0);
+      }
+    }
+  }
+}
+
+function applyYearToFeatureState(year) {
+  const yData = valuesByYear[year] || {};
+  for (const fips of Object.keys(seriesByState)) {
+    const v = yData[fips];
+    if (!v) continue;
+    map.setFeatureState(
+      { source:'states', sourceLayer: SOURCE_LAYER, id: fips },
+      { ad: v.ad, anx: v.anx, dep: v.dep }
+    );
+  }
+}
+
+/* Info boxes*/
+function updateHoverBox(fips) {
+  const nm = nameByState[fips] || fips;
+  const v = (valuesByYear[selectedYear] || {})[fips];
+  if (!v) {
+    document.getElementById('hoverBox').innerHTML = `<b>${nm}</b> (${fips})<br>Year: ${selectedYear}<br>No data`;
+    return;
+  }
+  document.getElementById('hoverBox').innerHTML =
+    `<b>${nm}</b> (${fips})<br>
+     Year: <b>${selectedYear}</b><br>
+     AD: <b>${v.ad.toFixed(1)}%</b><br>
+     Anxiety: ${v.anx.toFixed(1)}%<br>
+     Depression: ${v.dep.toFixed(1)}%`;
+}
+
+function updateSelectBox(fips) {
+  const nm = nameByState[fips] || fips;
+  const v = (valuesByYear[selectedYear] || {})[fips];
+  let html =
+    `<b>${nm}</b> (${fips})<br>
+     Selected year: <b>${selectedYear}</b><br>`;
+  if (v) {
+    html += `AD: <b>${v.ad.toFixed(1)}%</b> | Anxiety: ${v.anx.toFixed(1)}% | Depression: ${v.dep.toFixed(1)}%<br>`;
+  } else {
+    html += `No data for selected year.<br>`;
+  }
+
+  const series = seriesByState[fips] || [];
+  html += `<div style="margin-top:6px; padding-top:6px; border-top:1px solid #eee;">
+            <b>AD trend (2020–2024)</b><br>
+            ${series.map(d => `${d.year}: ${d.ad.toFixed(1)}%`).join('<br>')}
+           </div>`;
+
+  document.getElementById('selectBox').innerHTML = html;
+}
+
+/* Selection state*/
+function selectState(fips) {
+  selectedStatefp = fips;
+  map.setFilter(L_SELECTED, ['==', ['get','STATEFP'], fips]);
+  updateSelectBox(fips);
+  setChartSelectedState(fips);
+}
+
+function clearSelection() {
+  selectedStatefp = null;
+  map.setFilter(L_SELECTED, ['==', ['get','STATEFP'], '']);
+  document.getElementById('selectBox').innerHTML = 'Click a state (or a line) to select it.';
+  setChartDefaultState();
+}
+
+/* Plotly time-series chart */
+function buildChart() {
+  renderLegend();
+
+  const traces = [];
+  const stateFipsList = Object.keys(seriesByState).sort();
+
+  // 1) State lines
+  for (const fips of stateFipsList) {
+    const s = seriesByState[fips];
+    const x = s.map(d => d.year);
+    const y = s.map(d => d.ad);
+
+    const idx = traces.length;
+    traceIndexByState.set(fips, idx);
+
+    traces.push({
+      type: 'scatter',
+      mode: 'lines',
+      x, y,
+      name: nameByState[fips] || fips,
+      customdata: x.map(() => fips),
+      line: { width: 1, color: '#9e9e9e' },
+      opacity: 0.18,
+      hovertemplate: `${nameByState[fips] || fips}<br>%{x}: %{y:.1f}%<extra></extra>`
+    });
+  }
+
+  // 2) National mean line
+  nationalTraceIndex = traces.length;
+  traces.push({
+    type: 'scatter',
+    mode: 'lines',
+    x: YEARS,
+    y: YEARS.map(y => nationalMean[y]),
+    name: 'National mean',
+    customdata: YEARS.map(() => null),
+    line: { width: 3, dash: 'dash', color: '#111111' },
+    opacity: 1,
+    hovertemplate: `National mean<br>%{x}: %{y:.1f}%<extra></extra>`
+  });
+
+  const layout = {
+    height: 300,
+    margin: { l: 42, r: 10, t: 6, b: 35 },
+    xaxis: { dtick: 1 },
+    yaxis: { title: '%' },
+    showlegend: false
+  };
+
+  Plotly.newPlot('chart', traces, layout, { displayModeBar: false }).then(() => {
+    setChartDefaultState();
+
+    const chartDiv = document.getElementById('chart');
+
+    // Hover a line => highlight that state on chart AND map
+    chartDiv.on('plotly_hover', (evt) => {
+      const fips = evt.points?.[0]?.customdata;
+      if (!fips) return; // national mean
+
+      hoveredStatefp = fips;
+
+      setChartHoverState(fips);
+
+      // Map hover outline for the same state
+      map.setFilter(L_HOVER, ['==', ['get', 'STATEFP'], fips]);
+      updateHoverBox(fips);
+    });
+
+    //  Unhover => revert to default (national mean + grey lines)
+    chartDiv.on('plotly_unhover', () => {
+      hoveredStatefp = null;
+
+      map.setFilter(L_HOVER, ['==', ['get', 'STATEFP'], '']);
+      document.getElementById('hoverBox').innerHTML =
+        'Hover a state on the map (or a line) to see values.';
+
+      setChartDefaultState();
+    });
+
+    // Click a line => select that state
+    chartDiv.on('plotly_click', (evt) => {
+      const fips = evt.points?.[0]?.customdata;
+      if (!fips) return;
+      selectState(fips);
+    });
+  });
+}
+
+
+function setChartDefaultState() {
+ // Reset every state line to grey + low opacity
+  for (const [fips, idx] of traceIndexByState.entries()) {
+    Plotly.restyle('chart', {
+      opacity: 0.18,
+      'line.width': 1,
+      'line.color': '#9e9e9e'
+    }, [idx]);
+  }
+
+  Plotly.restyle('chart', {
+    opacity: 1,
+    'line.width': 3,
+    'line.color': '#111111',
+    'line.dash': 'dash'
+  }, [nationalTraceIndex]);//Ensure national mean line remains prominent
+}
+
+function setChartHoverState(fips) {
+  // return to the stable default
+  setChartDefaultState();
+
+  // emphasise the hovered state line
+  const idx = traceIndexByState.get(fips);
+  if (idx === undefined) return;
+
+  Plotly.restyle('chart', {
+    opacity: 1,
+    'line.width': 3,
+    'line.color': '#2166ac'
+  }, [idx]);
+}
+
+
+function setChartSelectedState(fips) {
+  setChartHoverState(fips);
+}
+
+
+
+(async function main(){
+  await loadCSV();
+  initMap();
+  buildChart();
+})();
+</script>
+</body>
+</html>
